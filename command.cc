@@ -17,19 +17,74 @@
 #include "command.h"
 #include "tokenizer.h"
 
-
 void parse(std::vector<Token> &tokens)
 {
-    Command currentCommand;
+    Command::_currentCommand.clear();
     SimpleCommand *currentSimpleCommand = new SimpleCommand();
-
-    currentCommand.execute();
-    /*
-      Implement this function 
-      you must parse for all possible tokens scenario
-      right now command.execute only print the format , you will inject it in your logic.
-
-    */
+    
+    int i = 0;
+    while (i < tokens.size())
+    {
+        Token token = tokens[i];
+        
+        if (token.type == TOKEN_EOF)
+        {
+            break;
+        }
+        
+        if (token.type == TOKEN_PIPE)
+        {
+            Command::_currentCommand.insertSimpleCommand(currentSimpleCommand);
+            currentSimpleCommand = new SimpleCommand();
+            i++;
+        }
+        else if (token.type == TOKEN_REDIRECT)
+        {
+            Command::_currentCommand._outFile = strdup(tokens[i+1].value.c_str());
+            Command::_currentCommand._append = 0;
+            i += 2;
+        }
+        else if (token.type == TOKEN_APPEND)
+        {
+            Command::_currentCommand._outFile = strdup(tokens[i+1].value.c_str());
+            Command::_currentCommand._append = 1;
+            i += 2;
+        }
+        else if (token.type == TOKEN_INPUT)
+        {
+            Command::_currentCommand._inputFile = strdup(tokens[i+1].value.c_str());
+            i += 2;
+        }
+        else if (token.type == TOKEN_ERROR)
+        {
+            Command::_currentCommand._errFile = strdup(tokens[i+1].value.c_str());
+            i += 2;
+        }
+        else if (token.type == TOKEN_BACKGROUND)
+        {
+            Command::_currentCommand._background = 1;
+            i++;
+        }
+        else
+        {
+            if (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT)
+            {
+                currentSimpleCommand->insertArgument(strdup(token.value.c_str()));
+            }
+            i++;
+        }
+    }
+    
+    if (currentSimpleCommand->_numberOfArguments > 0)
+    {
+        Command::_currentCommand.insertSimpleCommand(currentSimpleCommand);
+    }
+    else
+    {
+        delete currentSimpleCommand;
+    }
+    
+    Command::_currentCommand.execute();
 }
 
 SimpleCommand::SimpleCommand()
@@ -58,13 +113,15 @@ Command::Command()
 {
     _numberOfAvailableSimpleCommands = 1;
     _simpleCommands = (SimpleCommand **)
-        malloc(_numberOfSimpleCommands * sizeof(SimpleCommand *));
+        malloc(_numberOfAvailableSimpleCommands * sizeof(SimpleCommand *));
 
     _numberOfSimpleCommands = 0;
     _outFile = 0;
     _inputFile = 0;
     _errFile = 0;
     _background = 0;
+    _append = 0;
+    _out_error = 0;
 }
 
 void Command::insertSimpleCommand(SimpleCommand *simpleCommand)
@@ -113,6 +170,8 @@ void Command::clear()
     _inputFile = 0;
     _errFile = 0;
     _background = 0;
+    _append = 0;
+    _out_error = 0;
 }
 
 void Command::print()
@@ -143,10 +202,131 @@ void Command::print()
 
 void Command::execute()
 {
-    print();
-    /*
-        Write your code here
-    */
+    if (_numberOfSimpleCommands == 0)
+    {
+        clear();
+        prompt();
+        return;
+    }
+
+    // Built-in exit command
+    if (_numberOfSimpleCommands > 0 && _simpleCommands[0]->_numberOfArguments > 0)
+    {
+        if (strcmp(_simpleCommands[0]->_arguments[0], "exit") == 0)
+        {
+            printf("Good bye!!\n");
+            exit(0);
+        }
+        if (strcmp(_simpleCommands[0]->_arguments[0], "cd") == 0)
+        {
+            char *dir;
+            if (_simpleCommands[0]->_numberOfArguments > 1)
+            {
+                dir = _simpleCommands[0]->_arguments[1];
+            }
+            else
+            {
+                dir = getenv("HOME");
+            }
+            if (chdir(dir) < 0)
+            {
+                perror("cd failed");
+            }
+            clear();
+            prompt();
+            return;
+        }
+    }
+
+    int defaultin = dup(0);
+    int defaultout = dup(1);
+    int defaulterr = dup(2);
+
+    int fdin;
+    int fdout;
+    int fderr;
+
+    if (_inputFile)
+    {
+        fdin = open(_inputFile, O_RDONLY);
+        if (fdin < 0)
+        {
+            perror("Error opening input file");
+            clear();
+            prompt();
+            return;
+        }
+    }
+    else
+    {
+        fdin = dup(defaultin);
+    }
+
+    if (_errFile)
+    {
+        fderr = open(_errFile, O_CREAT | O_WRONLY | (_append ? O_APPEND : O_TRUNC), 0666);
+    }
+    else
+    {
+        fderr = dup(defaulterr);
+    }
+    dup2(fderr, 2);
+    close(fderr);
+
+    int ret = 0;
+    int fd[2];
+
+    for (int i = 0; i < _numberOfSimpleCommands; i++)
+    {
+        dup2(fdin, 0);
+        close(fdin);
+
+        if (i == _numberOfSimpleCommands - 1)
+        {
+            if (_outFile)
+            {
+                fdout = open(_outFile, O_CREAT | O_WRONLY | (_append ? O_APPEND : O_TRUNC), 0666);
+            }
+            else
+            {
+                fdout = dup(defaultout);
+            }
+        }
+        else
+        {
+            pipe(fd);
+            fdout = fd[1];
+            fdin = fd[0];
+        }
+
+        dup2(fdout, 1);
+        close(fdout);
+
+        ret = fork();
+        if (ret == 0)
+        {
+            execvp(_simpleCommands[i]->_arguments[0], _simpleCommands[i]->_arguments);
+            perror("execvp");
+            _exit(1);
+        }
+        else if (ret < 0)
+        {
+            perror("fork");
+            return;
+        }
+    }
+
+    dup2(defaultin, 0);
+    dup2(defaultout, 1);
+    dup2(defaulterr, 2);
+    close(defaultin);
+    close(defaultout);
+    close(defaulterr);
+
+    if (!_background)
+    {
+        waitpid(ret, NULL, 0);
+    }
 
     clear();
     prompt();
@@ -159,7 +339,13 @@ void Command::prompt()
     std::string input;
     while (true)
     {
-        std::getline(std::cin, input); 
+        std::getline(std::cin, input);
+        if (input.empty())
+        {
+            printf("myshell>");
+            fflush(stdout);
+            continue;
+        }
         std::vector<Token> tokens = tokenize(input);
         parse(tokens);
     }
